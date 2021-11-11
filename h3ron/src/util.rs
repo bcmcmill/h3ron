@@ -1,13 +1,6 @@
 use geo_types::{Coordinate, LineString, Point};
 
-use crate::Index;
-use h3ron_h3_sys::{degsToRads, GeoCoord, H3Index};
-
-#[inline]
-pub(crate) fn drain_h3indexes_to_indexes<T: Index>(mut v: Vec<H3Index>) -> Vec<T> {
-    // filters out 0 values ( = positions in the vec not used to store h3indexes, created by polyfill, k_ring, ...)
-    v.drain(..).filter(|h3i| *h3i != 0).map(T::new).collect()
-}
+use h3ron_h3_sys::{degsToRads, GeoBoundary, GeoCoord};
 
 pub(crate) unsafe fn coordinate_to_geocoord(c: &Coordinate<f64>) -> GeoCoord {
     GeoCoord {
@@ -25,4 +18,15 @@ pub(crate) unsafe fn point_to_geocoord(pt: &Point<f64>) -> GeoCoord {
         lat: degsToRads(pt.y()),
         lon: degsToRads(pt.x()),
     }
+}
+
+pub(crate) fn geoboundary_to_coordinates(gb: &GeoBoundary) -> Vec<Coordinate<f64>> {
+    let mut nodes = Vec::with_capacity(gb.numVerts as usize);
+    for i in 0..(gb.numVerts as usize) {
+        nodes.push(Coordinate::from((
+            unsafe { h3ron_h3_sys::radsToDegs(gb.verts[i].lon) },
+            unsafe { h3ron_h3_sys::radsToDegs(gb.verts[i].lat) },
+        )));
+    }
+    nodes
 }

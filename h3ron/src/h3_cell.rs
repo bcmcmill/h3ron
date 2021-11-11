@@ -5,18 +5,23 @@ use std::os::raw::c_int;
 use std::str::FromStr;
 
 use geo_types::{Coordinate, LineString, Point, Polygon};
+
+#[cfg(feature = "use-serde")]
 use serde::{Deserialize, Serialize};
 
 use h3ron_h3_sys::{GeoCoord, H3Index};
 
+use crate::collections::indexvec::IndexVec;
 use crate::error::Error;
-use crate::index::Index;
-use crate::util::{coordinate_to_geocoord, drain_h3indexes_to_indexes, point_to_geocoord};
-use crate::{max_k_ring_size, AreaUnits, FromH3Index, H3Edge, ToCoordinate, ToPolygon};
+use crate::index::{HasH3Resolution, Index};
+use crate::util::{coordinate_to_geocoord, geoboundary_to_coordinates, point_to_geocoord};
+use crate::{max_k_ring_size, ExactArea, FromH3Index, H3Edge, ToCoordinate, ToPolygon};
 use std::fmt::{self, Debug, Formatter};
+use std::ops::Deref;
 
 /// H3 Index representing a H3 Cell (hexagon)
-#[derive(PartialOrd, PartialEq, Clone, Serialize, Deserialize, Hash, Eq, Ord, Copy)]
+#[derive(PartialOrd, PartialEq, Clone, Hash, Eq, Ord, Copy)]
+#[cfg_attr(feature = "use-serde", derive(Serialize, Deserialize))]
 #[repr(transparent)]
 pub struct H3Cell(H3Index);
 
@@ -58,6 +63,12 @@ impl Index for H3Cell {
         } else {
             Ok(())
         }
+    }
+}
+
+impl HasH3Resolution for H3Cell {
+    fn h3_resolution(&self) -> u8 {
+        self.resolution()
     }
 }
 
@@ -116,27 +127,32 @@ impl H3Cell {
         res == 1
     }
 
-    pub fn k_ring(&self, k: u32) -> Vec<H3Cell> {
-        let max_size = unsafe { h3ron_h3_sys::maxKringSize(k as i32) as usize };
-        let mut h3_indexes_out: Vec<H3Index> = vec![0; max_size];
-
+    /// `k_ring` produces all cells within k distance of the origin cell.
+    ///
+    /// k-ring 0 is defined as the origin cell, k-ring 1 is defined as k-ring 0 and all
+    /// neighboring cells, and so on.
+    ///
+    /// # Note
+    ///
+    /// For repeated building of k-rings, there is also [`super::iter::KRingBuilder`].
+    pub fn k_ring(&self, k: u32) -> IndexVec<H3Cell> {
+        let mut index_vec =
+            IndexVec::with_length(unsafe { h3ron_h3_sys::maxKringSize(k as i32) as usize });
         unsafe {
-            h3ron_h3_sys::kRing(self.0, k as c_int, h3_indexes_out.as_mut_ptr());
+            h3ron_h3_sys::kRing(self.0, k as c_int, index_vec.as_mut_ptr());
         }
-        drain_h3indexes_to_indexes(h3_indexes_out)
+        index_vec
     }
 
-    pub fn hex_ring(&self, k: u32) -> Result<Vec<H3Cell>, Error> {
+    pub fn hex_ring(&self, k: u32) -> Result<IndexVec<H3Cell>, Error> {
         // calculation of max_size taken from
         // https://github.com/uber/h3-py/blob/dd08189b378429291c342d0af3d3cc1e38a659d5/src/h3/_cy/cells.pyx#L111
-        let max_size = if k > 0 { 6 * k as usize } else { 1 };
-        let mut h3_indexes_out: Vec<H3Index> = vec![0; max_size];
+        let mut index_vec = IndexVec::with_length(if k > 0 { 6 * k as usize } else { 1 });
 
-        let res = unsafe {
-            h3ron_h3_sys::hexRing(self.0, k as c_int, h3_indexes_out.as_mut_ptr()) as c_int
-        };
+        let res =
+            unsafe { h3ron_h3_sys::hexRing(self.0, k as c_int, index_vec.as_mut_ptr()) as c_int };
         if res == 0 {
-            Ok(drain_h3indexes_to_indexes(h3_indexes_out))
+            Ok(index_vec)
         } else {
             Err(Error::PentagonalDistortion)
         }
@@ -153,6 +169,11 @@ impl H3Cell {
     ///
     /// A `Vec` of `(u32, Index)` tuple is returned. The `u32` value is the K Ring distance
     /// of the `Index` value.
+    ///
+    /// # Note
+    ///
+    /// For repeated building of k-rings, there is also [`super::iter::KRingBuilder`].
+    ///
     pub fn k_ring_distances(&self, k_min: u32, k_max: u32) -> Vec<(u32, H3Cell)> {
         let max_size = max_k_ring_size(k_max);
         let mut h3_indexes_out: Vec<H3Index> = vec![0; max_size];
@@ -169,7 +190,7 @@ impl H3Cell {
     }
 
     pub fn hex_range_distances(&self, k_min: u32, k_max: u32) -> Result<Vec<(u32, H3Cell)>, Error> {
-        let max_size = unsafe { h3ron_h3_sys::maxKringSize(k_max as c_int) as usize };
+        let max_size = max_k_ring_size(k_max);
         let mut h3_indexes_out: Vec<H3Index> = vec![0; max_size];
         let mut distances_out: Vec<c_int> = vec![0; max_size];
         let res = unsafe {
@@ -208,15 +229,6 @@ impl H3Cell {
             .collect()
     }
 
-    /// exact area for a specific cell (hexagon or pentagon)
-    pub fn area(&self, area_units: AreaUnits) -> f64 {
-        match area_units {
-            AreaUnits::M2 => unsafe { h3ron_h3_sys::cellAreaM2(self.0) },
-            AreaUnits::Km2 => unsafe { h3ron_h3_sys::cellAreaKm2(self.0) },
-            AreaUnits::Radians2 => unsafe { h3ron_h3_sys::cellAreaRads2(self.0) },
-        }
-    }
-
     /// determines if an H3 cell is a pentagon
     pub fn is_pentagon(&self) -> bool {
         unsafe { h3ron_h3_sys::h3IsPentagon(self.0) == 1 }
@@ -250,16 +262,48 @@ impl H3Cell {
     }
 
     /// Retrieves all unidirectional H3 edges around `self`
-    pub fn unidirectional_edges(&self) -> Vec<H3Edge> {
-        let mut h3_edges_out: Vec<H3Index> = vec![0; 6];
-
+    ///
+    /// For repeated creation of [`H3Edge`] around a [`H3Cell`] also
+    /// see [`crate::iter::H3EdgesBuilder`], which is more efficient.
+    pub fn unidirectional_edges(&self) -> IndexVec<H3Edge> {
+        let mut index_vec = IndexVec::with_length(6);
         unsafe {
             h3ron_h3_sys::getH3UnidirectionalEdgesFromHexagon(
                 self.h3index(),
-                h3_edges_out.as_mut_ptr(),
+                index_vec.as_mut_ptr(),
             )
         };
-        drain_h3indexes_to_indexes(h3_edges_out)
+        index_vec
+    }
+
+    /// get the average cell area at `resolution` in square meters.
+    ///
+    /// ```
+    /// use h3ron::H3Cell;
+    ///
+    /// assert_eq!(15047.5, H3Cell::area_m2(10));
+    /// ```
+    pub fn area_m2(resolution: u8) -> f64 {
+        unsafe { h3ron_h3_sys::hexAreaM2(resolution as i32) }
+    }
+
+    /// get the average cell area at `resolution` in square kilometers.
+    pub fn area_km2(resolution: u8) -> f64 {
+        unsafe { h3ron_h3_sys::hexAreaKm2(resolution as i32) }
+    }
+}
+
+impl ExactArea for H3Cell {
+    fn exact_area_m2(&self) -> f64 {
+        unsafe { h3ron_h3_sys::cellAreaM2(self.0) }
+    }
+
+    fn exact_area_km2(&self) -> f64 {
+        unsafe { h3ron_h3_sys::cellAreaKm2(self.0) }
+    }
+
+    fn exact_area_rads2(&self) -> f64 {
+        unsafe { h3ron_h3_sys::cellAreaRads2(self.0) }
     }
 }
 
@@ -289,15 +333,9 @@ impl ToPolygon for H3Cell {
             mu.assume_init()
         };
 
-        let mut nodes = vec![];
-        for i in 0..gb.numVerts {
-            nodes.push((
-                unsafe { h3ron_h3_sys::radsToDegs(gb.verts[i as usize].lon) },
-                unsafe { h3ron_h3_sys::radsToDegs(gb.verts[i as usize].lat) },
-            ));
-        }
-        nodes.push(*nodes.first().unwrap());
-        Polygon::new(LineString::from(nodes), vec![])
+        let mut coordinates = geoboundary_to_coordinates(&gb);
+        coordinates.push(coordinates.first().copied().unwrap());
+        Polygon::new(LineString::from(coordinates), vec![])
     }
 }
 
@@ -316,12 +354,21 @@ impl ToCoordinate for H3Cell {
     }
 }
 
+impl Deref for H3Cell {
+    type Target = H3Index;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::convert::{TryFrom, TryInto};
     use std::str::FromStr;
 
+    #[cfg(feature = "use-serde")]
     use bincode::{deserialize, serialize};
 
     use h3ron_h3_sys::H3Index;
@@ -358,10 +405,18 @@ mod tests {
     }
 
     #[test]
+    fn test_eq() {
+        assert_eq!(
+            H3Cell::try_from(0x89283080ddbffff_u64).unwrap(),
+            H3Cell::try_from(0x89283080ddbffff_u64).unwrap()
+        );
+    }
+
+    #[test]
     fn test_hex_ring_1() {
         let idx = H3Cell::try_from(0x89283080ddbffff_u64).unwrap();
         let ring = idx.hex_ring(1).unwrap();
-        assert_eq!(ring.len(), 6);
+        assert_eq!(ring.iter().count(), 6);
         assert!(ring.iter().all(|index| index.is_valid()));
     }
 
@@ -369,7 +424,7 @@ mod tests {
     fn test_hex_ring_0() {
         let idx = H3Cell::new(0x89283080ddbffff_u64);
         let ring = idx.hex_ring(0).unwrap();
-        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.iter().count(), 1);
         assert!(ring.iter().all(|index| index.is_valid()));
     }
 
@@ -424,6 +479,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "use-serde")]
     #[test]
     fn serde_index_roundtrip() {
         let idx = H3Cell::new(0x89283080ddbffff_u64);
@@ -435,6 +491,7 @@ mod tests {
 
     /// this test is not really a hard requirement, but it is nice to know
     /// Index is handled just like an u64
+    #[cfg(feature = "use-serde")]
     #[test]
     fn serde_index_from_h3index() {
         let idx: H3Index = 0x89283080ddbffff_u64;
@@ -448,7 +505,7 @@ mod tests {
         let idx: H3Cell = 0x89283080ddbffff_u64.try_into().unwrap();
         let ring = idx.hex_ring(1).unwrap();
         let neighbor = ring.first().unwrap();
-        assert!(idx.is_neighbor_to(neighbor));
+        assert!(idx.is_neighbor_to(&neighbor));
         let wrong_neighbor = 0x8a2a1072b59ffff_u64.try_into().unwrap();
         assert!(!idx.is_neighbor_to(&wrong_neighbor));
         // Self
@@ -461,10 +518,10 @@ mod tests {
         assert_eq!(idx.distance_to(&idx), 0);
         let ring = idx.hex_ring(1).unwrap();
         let neighbor = ring.first().unwrap();
-        assert_eq!(idx.distance_to(neighbor), 1);
+        assert_eq!(idx.distance_to(&neighbor), 1);
         let ring = idx.hex_ring(3).unwrap();
         let neighbor = ring.first().unwrap();
-        assert_eq!(idx.distance_to(neighbor), 3);
+        assert_eq!(idx.distance_to(&neighbor), 3);
     }
 
     mod edges {
@@ -505,7 +562,7 @@ mod tests {
         fn can_find_edge_to() {
             let index: H3Cell = 0x89283080ddbffff_u64.try_into().unwrap();
             let ring = index.hex_ring(1).unwrap();
-            let neighbor = *ring.first().unwrap();
+            let neighbor = ring.first().unwrap();
             let edge_to = index.unidirectional_edge_to(&neighbor).unwrap();
             let edge_from = neighbor.unidirectional_edge_to(&index).unwrap();
             assert_ne!(edge_to.h3index(), 0);

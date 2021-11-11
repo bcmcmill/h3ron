@@ -1,10 +1,10 @@
-use crate::util::drain_h3indexes_to_indexes;
-use crate::Error;
+use crate::collections::indexvec::IndexVec;
+use crate::{Error, FromH3Index, H3Direction};
 use h3ron_h3_sys::H3Index;
 use std::os::raw::c_int;
 
 /// Trait to handle types having a H3 Index like cells and edges
-pub trait Index: Sized + PartialEq {
+pub trait Index: Sized + PartialEq + FromH3Index {
     /// Get the u64 H3 Index address
     fn h3index(&self) -> H3Index;
 
@@ -67,17 +67,34 @@ pub trait Index: Sized + PartialEq {
     }
 
     /// Retrieves all children of `self` at resolution `child_resolution`
-    fn get_children(&self, child_resolution: u8) -> Vec<Self> {
-        let max_size =
-            unsafe { h3ron_h3_sys::maxH3ToChildrenSize(self.h3index(), child_resolution as c_int) };
-        let mut h3_indexes_out: Vec<h3ron_h3_sys::H3Index> = vec![0; max_size as usize];
+    fn get_children(&self, child_resolution: u8) -> IndexVec<Self> {
+        let mut index_vec = IndexVec::with_length(unsafe {
+            h3ron_h3_sys::maxH3ToChildrenSize(self.h3index(), child_resolution as c_int)
+        } as usize);
         unsafe {
             h3ron_h3_sys::h3ToChildren(
                 self.h3index(),
                 child_resolution as c_int,
-                h3_indexes_out.as_mut_ptr(),
+                index_vec.as_mut_ptr(),
             );
         }
-        drain_h3indexes_to_indexes(h3_indexes_out)
+        index_vec
     }
+
+    /// Retrieves the direction of the current index
+    fn direction(&self) -> H3Direction {
+        H3Direction::direction(self)
+    }
+
+    /// Retrieves the direction of the current index relative to a parent at `target_resolution`
+    fn direction_to_parent_resolution(&self, target_resolution: u8) -> Result<H3Direction, Error> {
+        H3Direction::direction_to_parent_resolution(self, target_resolution)
+    }
+}
+
+/// trait to be implemented by all structs being based
+/// on H3 data with a given resolution
+pub trait HasH3Resolution {
+    /// Gets the index resolution (0-15)
+    fn h3_resolution(&self) -> u8;
 }

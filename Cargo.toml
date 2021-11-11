@@ -4,9 +4,12 @@ members = [
     "h3ron-h3-sys",
     "h3ron",
     "h3ron-ndarray",
-    "h3ronpy",
+    "h3ron-graph",
 ]
 [profile.release]
 #debug = true # for flamegraph
 debug = false
 lto = "fat"
+
+[profile.bench]
+debug = true

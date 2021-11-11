@@ -1,12 +1,13 @@
-use std::collections::HashMap;
+use crate::collections::H3CellMap;
 use std::os::raw::c_int;
 
 use geo::algorithm::euclidean_distance::EuclideanDistance;
-use geo_types::{Coordinate, LineString, Point, Polygon};
+use geo_types::{Coordinate, LineString, MultiLineString, Point, Polygon};
 
 use h3ron_h3_sys::{destroyLinkedPolygon, h3SetToLinkedGeo, radsToDegs, H3Index, LinkedGeoPolygon};
 
 use crate::algorithm::smoothen_h3_linked_polygon;
+use crate::collections::indexvec::IndexVec;
 use crate::collections::CompactedCellVec;
 use crate::{Error, H3Cell, Index};
 
@@ -23,6 +24,11 @@ pub trait ToLineString {
     fn to_linestring_unchecked(&self) -> LineString<f64>;
 }
 
+pub trait ToMultiLineString {
+    fn to_multilinestring(&self) -> Result<MultiLineString<f64>, Error>;
+    fn to_multilinestring_unchecked(&self) -> MultiLineString<f64>;
+}
+
 /// join hexagon polygons to larger polygons where hexagons are touching each other
 pub trait ToLinkedPolygons {
     fn to_linked_polygons(&self, smoothen: bool) -> Vec<Polygon<f64>>;
@@ -31,6 +37,15 @@ pub trait ToLinkedPolygons {
 impl ToLinkedPolygons for Vec<H3Cell> {
     fn to_linked_polygons(&self, smoothen: bool) -> Vec<Polygon<f64>> {
         let mut cells = self.clone();
+        cells.sort_unstable();
+        cells.dedup();
+        to_linked_polygons(&cells, smoothen)
+    }
+}
+
+impl ToLinkedPolygons for IndexVec<H3Cell> {
+    fn to_linked_polygons(&self, smoothen: bool) -> Vec<Polygon<f64>> {
+        let mut cells = self.iter().collect::<Vec<_>>();
         cells.sort_unstable();
         cells.dedup();
         to_linked_polygons(&cells, smoothen)
@@ -73,7 +88,7 @@ impl ToAlignedLinkedPolygons for Vec<H3Cell> {
         align_to_h3_resolution: u8,
         smoothen: bool,
     ) -> Vec<Polygon<f64>> {
-        let mut cells_grouped = HashMap::new();
+        let mut cells_grouped = H3CellMap::default();
         for cell in self.iter() {
             let parent_cell = cell.get_parent_unchecked(align_to_h3_resolution);
             cells_grouped
